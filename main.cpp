@@ -1,5 +1,3 @@
-#include <iostream>
-#include <cstdlib>
 #include "TriangleApplication.h"
 
 //Create an application to draw a triagle
