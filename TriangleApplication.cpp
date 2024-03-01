@@ -13,7 +13,7 @@ void TriangleApplication::initWindow()
 	glfwInit();
 
 	glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-	glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
+	glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
 
 	//Create window
 	m_window = glfwCreateWindow(800, 600, "Vulkan", nullptr, nullptr);
@@ -26,9 +26,15 @@ void TriangleApplication::initVulkan()
 	selectPhysicalDevice(); //Select a suitable physical device
 	createLogicalDevice(); //Create a logical device to interface with the physical device
 	createSwapChain(); //Create swapchain after checking for GPU extension and surface capabilities
-	getSwapChainImages();
 	createImageView(); //To use the image in the swapchain, we have to create the image view
+	
+	createRenderPass();//To describe the framebuffer attachments (color, depth, sampling, ... attached to the framebuffer) to Vulkan
 	createGraphicsPipeline(); //To create a graphic pipeline to bring image to screen. Input --> pipeline --> screen
+	createFrameBuffer(); //To create a big wrapper of what to be drawn to the screen
+	createCommandPool(); //To create a command pool to store and allocate memory for the command buffers
+	createCommandBuffer(); //To create a command buffer
+	createSyncObjects();
+
 }
 
 void TriangleApplication::mainLoop()
@@ -37,11 +43,33 @@ void TriangleApplication::mainLoop()
 	while (!glfwWindowShouldClose(m_window))
 	{
 		glfwPollEvents();
+		drawFrames();
+		currentFrame = (currentFrame + 1) % MAX_IN_FLIGHT_FRAMES;
 	}
+	vkDeviceWaitIdle(m_device);
 }
 
 void TriangleApplication::cleanup()
 {
+	cleanup();
+
+	for (int i = 0; i < MAX_IN_FLIGHT_FRAMES; i++)
+	{
+		vkDestroySemaphore(m_device, m_imageAvailableSemaphores[i], nullptr);
+		vkDestroySemaphore(m_device, m_renderFinishedSemaphores[i], nullptr);
+		vkDestroyFence(m_device, m_inFlightFences[i], nullptr);
+	}
+
+	vkDestroyCommandPool(m_device, m_commandPool, nullptr);
+	for (const auto& frameBuffer : m_swapChainFramebuffers)
+	{
+		vkDestroyFramebuffer(m_device, frameBuffer, nullptr);
+	}
+	vkDestroyShaderModule(m_device, m_vertextShaderModule, nullptr);
+	vkDestroyShaderModule(m_device, m_fragmentShaderModule, nullptr);
+	vkDestroyPipeline(m_device, m_pipeline, nullptr);
+	vkDestroyPipelineLayout(m_device, m_pipelineLayout, nullptr);
+	vkDestroyRenderPass(m_device, m_renderPass, nullptr);
 	for (const auto& imageView : m_imageViews)
 	{
 		vkDestroyImageView(m_device, imageView, nullptr);
@@ -54,6 +82,110 @@ void TriangleApplication::cleanup()
 	
 	glfwDestroyWindow(m_window);
 	glfwTerminate();
+}
+
+void TriangleApplication::drawFrames()
+{
+	//draw frames
+	/*
+	On GPU:
+	Accquire the image from the swapchain <-----|
+				|								|
+				|								|
+				V								|
+	execute commands that draw the image		|
+				|								|
+				|								|
+				V								|
+	present the image to the screen				|
+				|								|
+				|								|
+				V								|
+	return the image to the swapchain-----------|
+
+	All of them are executed asynchronously --> need synchronization
+
+	Use Semaphore --> Wait on GPU --> does not block execution (on CPU)
+	Fences --> Wait on CPU --> does block executions
+
+	e.g: 
+	Semaphore S;
+	Task A, B;
+	vkQueueSubmit(A, signal: S, wait: None);
+	vkQueueSubmit(B, signal: None, wait: S); wait for signal S from A. A and B are executed quite the same time, but B waits for A on GPU
+
+	Fence F;
+	Task A, B;
+	vkQueueSubmit(A, fence: F);
+	vkWaitForFences(F); blocks the next execution until A done and F is signaled
+
+	vkQueueSubmit(B, fence: F);
+	*/
+
+	vkWaitForFences(m_device, 1, &m_inFlightFences[currentFrame], VK_TRUE, UINT64_MAX); //wait for an in flight image to be rendered
+	//Wait for previous frame to finish first, then the fence and the semaphore can be used
+	//As wait for fence is waiting until fence is in signaled state, then first frame could be blocked infinitely --> set the state of the fence tobe signaled when it is created
+	
+	vkResetFences(m_device, 1, &m_inFlightFences[currentFrame]); //Reset the fence to the unsignaled state before reuse it again
+	
+	//Aquire next image from the swapchain
+	uint32_t imageIndex;
+	VkResult getImageResult = vkAcquireNextImageKHR(m_device, m_swapchain, UINT64_MAX, m_imageAvailableSemaphores[currentFrame], VK_NULL_HANDLE, &imageIndex);
+	if (getImageResult == VK_ERROR_OUT_OF_DATE_KHR)
+	{
+		recreateSwapchain();
+		return;
+	}
+	else if (getImageResult != VK_SUCCESS && getImageResult != VK_SUBOPTIMAL_KHR)
+	{
+		throw std::runtime_error("failed to acquire next image from swapchain");
+	}
+	//VK_ERROR_OUT_OF_DATE_KHR: the swapchain is out of date and can not perform presentation to the surface
+	//VK_SUBOPTIMAL_KHR: the swapchain is still able to present the image to the surface, but the setting of the surface is not match --> wrongly display the image, but no error
+
+	//record command buffer
+	vkResetCommandBuffer(m_commandBuffers[currentFrame], 0);
+	recordCommandBuffer(m_commandBuffers[currentFrame], imageIndex);
+
+	//submit command buffer
+	VkSubmitInfo submitInfo{};
+	submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+
+	VkSemaphore waitSemaphores[] = { m_imageAvailableSemaphores[currentFrame]}; //Which semaphores to wait on before execution begins
+	VkPipelineStageFlags waitStages[] = { VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT }; //Which pipeline state to wait on before execution begins
+	submitInfo.waitSemaphoreCount = 1;
+	submitInfo.pWaitSemaphores = waitSemaphores;
+	submitInfo.pWaitDstStageMask = waitStages;
+
+	submitInfo.commandBufferCount = 1;
+	submitInfo.pCommandBuffers = &m_commandBuffers[currentFrame];
+
+	VkSemaphore signalSemaphores[]{ m_renderFinishedSemaphores[currentFrame]}; //Which semaphores to signal once the command buffer has finished execution
+	submitInfo.signalSemaphoreCount = 1;
+	submitInfo.pSignalSemaphores = signalSemaphores;
+
+	if (vkQueueSubmit(m_graphicQueue, 1, &submitInfo, m_inFlightFences[currentFrame]) != VK_SUCCESS)
+	{
+		throw std::runtime_error("failed to submit draw command buffer");
+	}
+
+	VkPresentInfoKHR presentInfo{};
+	presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+	presentInfo.waitSemaphoreCount = 1;
+	presentInfo.pWaitSemaphores = signalSemaphores;
+
+	VkSwapchainKHR swapchains[] = { m_swapchain };
+	presentInfo.swapchainCount = 1;
+	presentInfo.pSwapchains = swapchains;
+	presentInfo.pImageIndices = &imageIndex;
+
+	presentInfo.pResults = nullptr;
+
+
+	if (vkQueuePresentKHR(m_presentQueue, &presentInfo) != VK_SUCCESS)
+	{
+		throw std::runtime_error("failed to present image");
+	};
 }
 
 void TriangleApplication::createVkInstance()
@@ -93,14 +225,15 @@ void TriangleApplication::createVkInstance()
 	createInfo.enabledLayerCount = static_cast<uint32_t>(validationLayers.size());
 	createInfo.ppEnabledLayerNames = validationLayers.data();//Leave the custom error message for later
 
-	if (vkCreateInstance(&createInfo, nullptr, &m_instance) != VK_SUCCESS) {
+ 	if (vkCreateInstance(&createInfo, nullptr, &m_instance) != VK_SUCCESS) {
 		throw std::runtime_error("failed to create instance!");
 	}
 }
 
 void TriangleApplication::createSurface()
 {
-	if (glfwCreateWindowSurface(m_instance, m_window, nullptr, &m_surface) != VK_SUCCESS)
+	auto result = glfwCreateWindowSurface(m_instance, m_window, nullptr, &m_surface);
+	if (result != VK_SUCCESS)
 	{
 		throw std::runtime_error("failed to create window surface");
 	}
@@ -211,7 +344,7 @@ void TriangleApplication::createSwapChain()
 	//Select the properties from available ones
 	m_format = selectSurfaceDisplayFormat(m_swapchainDetails.formats);
 	m_presentMode = selectSurfaceDisplayMode(m_swapchainDetails.presentModes);
-	VkExtent2D extent = selectSurfaceDisplayExtent(m_swapchainDetails.capabilities);
+	m_extent = selectSurfaceDisplayExtent(m_swapchainDetails.capabilities);
 
 	uint32_t imageCount = m_swapchainDetails.capabilities.minImageCount + 1; //Avoid GPU internal waiting
 	if (m_swapchainDetails.capabilities.maxImageCount > 0 && imageCount > m_swapchainDetails.capabilities.maxImageCount)
@@ -227,7 +360,7 @@ void TriangleApplication::createSwapChain()
 	createInfo.imageFormat = m_format.format;
 	createInfo.imageColorSpace = m_format.colorSpace;
 
-	createInfo.imageExtent = extent;
+	createInfo.imageExtent = m_extent;
 
 	createInfo.imageArrayLayers = 1;
 	createInfo.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
@@ -263,6 +396,8 @@ void TriangleApplication::createSwapChain()
 	{
 		throw std::runtime_error("failed to create swapchain");
 	}
+
+	getSwapChainImages();
 }
 
 void TriangleApplication::createImageView() {
@@ -295,9 +430,390 @@ void TriangleApplication::createImageView() {
 	}
 }
 
+void TriangleApplication::createRenderPass()
+{
+	//Function to create a render pass
+	VkAttachmentDescription attachmentDescriptor{};
+	attachmentDescriptor.format = m_format.format;
+	attachmentDescriptor.samples = VK_SAMPLE_COUNT_1_BIT;
+
+	attachmentDescriptor.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; 
+	// Defines what to do with the data in the attachment before rendering and after rendering.
+	// It will clear the framebuffer before rendering and make it black before draw a new frame.
+	attachmentDescriptor.storeOp = VK_ATTACHMENT_STORE_OP_STORE; //rendered content will be stored and can be read later on.
+
+	attachmentDescriptor.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+	attachmentDescriptor.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+
+	//set up layout for the image. images need to be transitioned to specific layouts
+	attachmentDescriptor.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED; //Which layout the image has before the render pass begin
+	attachmentDescriptor.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR; //After rendering (previous image), the current image should be ready for presentation via swapchain
+
+	//Subpasss
+	//Instead of a big render pass, we can divided it into several subpasses with separated logical phases, like a chain
+	// subpass 1 --> subpass 2 --> subpass 3 ... subpass n: geometry pass -> lighting pass ...
+	// Better for GPU to perform various optimization for each subpass
+	// Subpasses need a reference to the attachment, not own them
+	VkAttachmentReference attachmentRef{};
+	attachmentRef.attachment = 0; //Index of the attachment in VkRenderPassCreateInfo::pAttachments. 1 attachment only --> index = 0
+	attachmentRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL; //During the subpass the image will be move to this layout. Optimization here
+
+	VkSubpassDescription subpass{};
+	subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+	subpass.colorAttachmentCount = 1;
+	subpass.pColorAttachments = &attachmentRef;
+
+	//Create render pass
+	VkRenderPassCreateInfo renderPassInfo{};
+	renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+	renderPassInfo.attachmentCount = 1;
+	renderPassInfo.pAttachments = &attachmentDescriptor; //list of attachment descriptors
+	renderPassInfo.subpassCount = 1;
+	renderPassInfo.pSubpasses = &subpass; //list of subpass
+
+
+	//subpass dependencies
+	//Controlling the image layout transition
+	VkSubpassDependency dependency{};
+	dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
+	dependency.dstSubpass = 0;
+	dependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT; //stage before this stage
+	dependency.srcAccessMask = 0;
+	dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+	dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+
+	renderPassInfo.dependencyCount = 1;
+	renderPassInfo.pDependencies = &dependency;
+
+	if (vkCreateRenderPass(m_device, &renderPassInfo, nullptr, &m_renderPass) != VK_SUCCESS)
+	{
+		throw std::runtime_error("failed to create renderpass");
+	}
+}
+
 void TriangleApplication::createGraphicsPipeline()
 {
 	//Read the shaders: vertext shader and fragment shader
+	std::vector<char> vertShaderCode = readFile("vert.spv");
+	std::vector<char> fragShaderCode = readFile("frag.spv");
+
+	//After having the code, wrap it in to a vKShaderModule
+	m_vertextShaderModule = createShaderModule(vertShaderCode);
+	m_fragmentShaderModule = createShaderModule(fragShaderCode);
+
+	//Create a shader stage for the pipeline: Vertex shader and fragment shader
+	//Wrapper of the code
+	VkPipelineShaderStageCreateInfo vertextShaderStageInfo{};
+	VkPipelineShaderStageCreateInfo fragmentShaderStageInfo{};
+
+	vertextShaderStageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+	vertextShaderStageInfo.stage = VK_SHADER_STAGE_VERTEX_BIT;
+	vertextShaderStageInfo.module = m_vertextShaderModule;
+	vertextShaderStageInfo.pName = "main"; //The entry point to call the shader function
+
+	fragmentShaderStageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+	fragmentShaderStageInfo.stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+	fragmentShaderStageInfo.module = m_fragmentShaderModule;
+	fragmentShaderStageInfo.pName = "main";
+
+	VkPipelineShaderStageCreateInfo shaderStageInfos[] = { vertextShaderStageInfo, fragmentShaderStageInfo };
+	
+	/*SET UP FIXED-FUNCTION*/
+	
+	//Set up dynamic states
+	//VK_DYNAMIC_STATE_VIEWPORT: make the viewport changeable in runtime while does not have to recreate the pipeline 
+	//VK_DYNAMIC_STATE_SCISSOR: same
+	VkPipelineDynamicStateCreateInfo dynamicStateInfo{};
+	dynamicStateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+	dynamicStateInfo.dynamicStateCount = static_cast<uint32_t>(dynamicStates.size());
+	dynamicStateInfo.pDynamicStates = dynamicStates.data();
+
+	//Set up vertex input
+	VkPipelineVertexInputStateCreateInfo vertexInputInfo{};
+	vertexInputInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+	//We hard code the vertex input in the shader then these are not needed
+	vertexInputInfo.vertexAttributeDescriptionCount = 0;
+	vertexInputInfo.pVertexAttributeDescriptions = nullptr;
+	vertexInputInfo.vertexBindingDescriptionCount = 0;
+	vertexInputInfo.pVertexBindingDescriptions = nullptr;
+
+	//Set up input assembly
+	//Defines how the vertices will be comsumed: point (1 vertex each), line (2 vertices each) or triangle (3 vertices each)
+	VkPipelineInputAssemblyStateCreateInfo inputAssemblyInfo{};
+	inputAssemblyInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+	inputAssemblyInfo.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+	inputAssemblyInfo.primitiveRestartEnable = VK_FALSE; //Not possible to break up lines and triangles in the _STRIP topology
+
+	//Viewport and Scissor
+	//Viewport: Describe the region of the framebuffer that the output will be rendered to --> the region on the screen, scaling the image to the viewport
+	//Scissor: Describe the actual pixels on the screen that will be used to render the framebuffer.---> cut the viewport to the defined scissor
+	VkViewport viewPort{};
+	viewPort.x = 0.0f;
+	viewPort.y = 0.0f;
+	viewPort.width = (float) m_extent.width;
+	viewPort.height = (float)m_extent.height;
+	viewPort.minDepth = 0.0f;
+	viewPort.maxDepth = 1.0f;
+
+	VkRect2D scissor{}; //Rectangle2D
+	scissor.offset = { 0,0 }; 
+	scissor.extent = m_extent; //is extent is different to the current extent, the image will be cut to match the extent
+
+	VkPipelineViewportStateCreateInfo viewportState{};
+	viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+	viewportState.viewportCount = 1;
+	viewportState.pViewports = &viewPort;
+	viewportState.scissorCount = 1;
+	viewportState.pScissors = &scissor;
+
+	//Set up rasterize
+	//Rasterization: transfrom shape created by vertices to fragments combined by pixels
+	VkPipelineRasterizationStateCreateInfo rasterizer{};
+	rasterizer.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+	rasterizer.depthClampEnable = VK_FALSE; //If enable --> discard the fragments that are beyond the near and far plane. requires enabling a GPU feature 
+	rasterizer.rasterizerDiscardEnable = VK_FALSE; //if true --> discard any output to the framebuffer
+	rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
+	/*
+	- VK_POLYGON_MODE_FILL: fill the area of the polygon with fragments
+	- VK_POLYGON_MODE_LINE: draw the polygon edges as line
+	- VK_POLYGON_MODE_POINT: draw the polygon vertices as point
+	*/
+	rasterizer.lineWidth = 1.0f;
+	rasterizer.cullMode = VK_CULL_MODE_BACK_BIT; //What is culling? Droping objects that are theoretically not visible
+	rasterizer.frontFace = VK_FRONT_FACE_CLOCKWISE;
+	
+	rasterizer.depthBiasEnable = VK_FALSE;
+	rasterizer.depthBiasConstantFactor = 0.0f; // Optional
+	rasterizer.depthBiasClamp = 0.0f; // Optional
+	rasterizer.depthBiasSlopeFactor = 0.0f; // Optional
+
+	//Set up multisampling
+	//for Anti-aliasing
+	//combining the fragment shader results of multiple polygons that rasterize to the same pixel: input ---fragment shader --> pixels
+	VkPipelineMultisampleStateCreateInfo multisampling{};
+	multisampling.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+	multisampling.sampleShadingEnable = VK_FALSE;
+	multisampling.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+	multisampling.minSampleShading = 1.0f; // Optional
+	multisampling.pSampleMask = nullptr; // Optional
+	multisampling.alphaToCoverageEnable = VK_FALSE; // Optional
+	multisampling.alphaToOneEnable = VK_FALSE; // Optional
+
+	//Depth and stencil testing
+	//Disable for now
+
+	//Color blending
+	/*
+	- Mix old value and new value to create a final color
+	- Combine old and new value using bitwise operation
+	*/
+	
+	/* There are 2 structs for this
+	- VkPipelineColorBlendAttachmentState: configuration per attached framebuffer (1 attached framebuffer only) --> attached to a framebuffer
+	- VkPipelineColorBlendStateCreateInfo: GLOBAL configuration (all framebuffers)
+	*/
+	VkPipelineColorBlendAttachmentState colorBlendingAttachment{};
+	colorBlendingAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT; //1111 for rgba
+	colorBlendingAttachment.blendEnable = VK_FALSE; //No blending
+	colorBlendingAttachment.srcColorBlendFactor = VK_BLEND_FACTOR_ONE; // Optional
+	colorBlendingAttachment.dstColorBlendFactor = VK_BLEND_FACTOR_ZERO; // Optional
+	colorBlendingAttachment.colorBlendOp = VK_BLEND_OP_ADD; // Optional
+	colorBlendingAttachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE; // Optional
+	colorBlendingAttachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO; // Optional
+	colorBlendingAttachment.alphaBlendOp = VK_BLEND_OP_ADD; // Optional
+
+	VkPipelineColorBlendStateCreateInfo colorBlend{};
+	colorBlend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+	colorBlend.attachmentCount = 1;
+	colorBlend.pAttachments = &colorBlendingAttachment;
+	colorBlend.blendConstants[0] = 0.0f;
+	colorBlend.blendConstants[1] = 0.0f;
+	colorBlend.blendConstants[2] = 0.0f;
+	colorBlend.blendConstants[3] = 0.0f;
+
+
+	//Create pipeline layout
+	VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
+	pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+	pipelineLayoutInfo.setLayoutCount = 0; //Optional
+	pipelineLayoutInfo.pSetLayouts = nullptr; //Optional
+	pipelineLayoutInfo.pushConstantRangeCount = 0; //Optional
+	pipelineLayoutInfo.pPushConstantRanges = nullptr; //Optional
+	if (vkCreatePipelineLayout(m_device, &pipelineLayoutInfo, nullptr, &m_pipelineLayout) != VK_SUCCESS)
+	{
+		throw std::runtime_error("failed to create pipeline layout");
+	}
+
+	//Create the pipeline
+	VkGraphicsPipelineCreateInfo pipelineInfo{};
+	pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+	pipelineInfo.stageCount = 2;
+	pipelineInfo.pStages = shaderStageInfos; // vertex shader stage and fragment shader stage
+
+	pipelineInfo.pVertexInputState = &vertexInputInfo; 
+	pipelineInfo.pInputAssemblyState = &inputAssemblyInfo;
+	pipelineInfo.pViewportState = &viewportState;
+	pipelineInfo.pRasterizationState = &rasterizer;
+	pipelineInfo.pMultisampleState = &multisampling;
+	pipelineInfo.pDepthStencilState = nullptr;
+	pipelineInfo.pColorBlendState = &colorBlend;
+	pipelineInfo.pDynamicState = &dynamicStateInfo;
+
+	pipelineInfo.layout = m_pipelineLayout;
+
+	pipelineInfo.renderPass = m_renderPass;
+	pipelineInfo.subpass = 0; //Index of the subpass
+
+	pipelineInfo.basePipelineHandle = VK_NULL_HANDLE; // Optional
+	pipelineInfo.basePipelineIndex = -1; // Optional
+
+	if (vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipeline) != VK_SUCCESS)
+	{
+		throw std::runtime_error("failed to create graphics pipeline");
+	}
+}
+
+void TriangleApplication::createFrameBuffer()
+{
+	m_swapChainFramebuffers.resize(m_imageViews.size());
+	
+	for (size_t i = 0; i < m_imageViews.size(); i++)
+	{
+		VkImageView attachments[] = { m_imageViews[i] }; 
+
+		VkFramebufferCreateInfo frameBufferInfo{};
+		frameBufferInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+		frameBufferInfo.renderPass = m_renderPass;
+		frameBufferInfo.attachmentCount = 1; //1 attachment in the framebuffer
+		frameBufferInfo.pAttachments = attachments;
+		frameBufferInfo.width = m_extent.width;
+		frameBufferInfo.height = m_extent.height;
+		frameBufferInfo.layers = 1;
+		
+		if (vkCreateFramebuffer(m_device, &frameBufferInfo, nullptr, &m_swapChainFramebuffers[i]) != VK_SUCCESS)
+		{
+			throw std::runtime_error("failed to create framebuffer");
+		}
+	}
+}
+
+void TriangleApplication::createCommandPool()
+{
+	VkCommandPoolCreateInfo commandPoolInfo{};
+	commandPoolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+	commandPoolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT; //individually reset the command buffers instead of all of them
+	commandPoolInfo.queueFamilyIndex = m_queueIndices.graphicsFamily.value(); //Command buffers will be submitted to the input queue
+
+	if (vkCreateCommandPool(m_device, &commandPoolInfo, nullptr, &m_commandPool) != VK_SUCCESS)
+	{
+		throw std::runtime_error("failed to create command pool");
+	}
+}
+
+void TriangleApplication::createCommandBuffer()
+{
+	m_commandBuffers.resize(MAX_IN_FLIGHT_FRAMES);
+	VkCommandBufferAllocateInfo createInfo{};
+	createInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+	createInfo.commandBufferCount = 1;
+	createInfo.commandPool = m_commandPool;
+	createInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; //can be submitted directly to a queue for execution, secondary ones is called from primary(s)
+	createInfo.commandBufferCount = MAX_IN_FLIGHT_FRAMES;
+
+	if (vkAllocateCommandBuffers(m_device, &createInfo, m_commandBuffers.data()) != VK_SUCCESS)
+	{
+		throw std::runtime_error("failed to allocate command buffer");
+	}
+}
+
+void TriangleApplication::recordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t imageIndex)
+{
+	VkCommandBufferBeginInfo beginInfo{};
+	beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+	beginInfo.flags = 0;
+	beginInfo.pInheritanceInfo = nullptr;
+
+	if (vkBeginCommandBuffer(commandBuffer, &beginInfo) != VK_SUCCESS)
+	{
+		throw std::runtime_error("failed to begin recording command buffer");
+	}
+
+	//Starting a render pass
+	VkRenderPassBeginInfo renderPassBeginInfo{};
+	renderPassBeginInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+	renderPassBeginInfo.renderPass = m_renderPass;
+	renderPassBeginInfo.framebuffer = m_swapChainFramebuffers[imageIndex];
+	
+	renderPassBeginInfo.renderArea.extent = m_extent;
+	renderPassBeginInfo.renderArea.offset = { 0,0 };
+
+	VkClearValue clearColorValue = { {{0.0f, 0.0f, 0.0f, 1.0f}} }; //The color used to clear the frambuffer at the beginning of the renderpass
+	renderPassBeginInfo.clearValueCount = 1;
+	renderPassBeginInfo.pClearValues = &clearColorValue;
+
+	//begin the render pass
+	vkCmdBeginRenderPass(commandBuffer, &renderPassBeginInfo, VK_SUBPASS_CONTENTS_INLINE); //The renderpass can now begin
+
+	//Bind the command buffer to a pipeline
+	vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipeline); //The second param defines if it is a graphics or compute pipeline
+
+	//set the viewport and scissor
+	VkViewport viewport{};
+	viewport.x = 0.0f;
+	viewport.y = 0.0f;
+	viewport.height = (float)m_extent.height;
+	viewport.width = (float)m_extent.width;
+	viewport.minDepth = 0.0f;
+	viewport.maxDepth = 1.0f;
+
+	VkRect2D scissor{};
+	scissor.extent = m_extent;
+	scissor.offset = { 0,0 };
+
+	vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
+	vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
+	
+
+	//Perform draw
+	/*
+	- vertexCount: number of vertices to be drawn
+	- instanceCount: used for instanced rendering (draw an instance repeatedly). Set as 1 if dont use
+	- firstVertex: first vertex to be drawn, usually the lowest value of gl_VertexIndex = index 0
+	- firstInstance: same
+	*/
+	vkCmdDraw(commandBuffer, 3, 1, 0, 0);
+
+	//end writing to render pass
+	vkCmdEndRenderPass(commandBuffer);
+	//end writing to command buffer
+	if (vkEndCommandBuffer(commandBuffer) != VK_SUCCESS)
+	{
+		throw std::runtime_error("failed to end the command buffer");
+	}
+}
+
+void TriangleApplication::createSyncObjects()
+{
+	m_imageAvailableSemaphores.resize(MAX_IN_FLIGHT_FRAMES);
+	m_renderFinishedSemaphores.resize(MAX_IN_FLIGHT_FRAMES);
+	m_inFlightFences.resize(MAX_IN_FLIGHT_FRAMES);
+
+	VkSemaphoreCreateInfo semaphoreInfo{};
+	semaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+
+	VkFenceCreateInfo fenceInfo{};
+	fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+	fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT; //for the first frame to be not blocked
+
+	for (int i=0; i<MAX_IN_FLIGHT_FRAMES; i++)
+	{ 
+		if (vkCreateSemaphore(m_device, &semaphoreInfo, nullptr, &m_imageAvailableSemaphores[i])
+			|| vkCreateSemaphore(m_device, &semaphoreInfo, nullptr, &m_renderFinishedSemaphores[i])
+			|| vkCreateFence(m_device, &fenceInfo, nullptr, &m_inFlightFences[i]) != VK_SUCCESS)
+		{
+			throw std::runtime_error("failed to create synchronization objects");
+		}
+	}
 }
 //Function to evaluate the suitability of the device
 bool TriangleApplication::isDeviceSuitable(VkPhysicalDevice device){
@@ -327,10 +843,10 @@ bool TriangleApplication::isDeviceSuitable(VkPhysicalDevice device){
 	//Find the suitable device
 	return 
 		deviceProperties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU && 
-		deviceFeatures.geometryShader && 
+		deviceFeatures.geometryShader && //App needs device has discrete GPU and available for geometryShader
 		indices.isComplete() && 
 		isExtensionSupported &&
-		isSwapChainSurfaceSupported; //App needs device has discrete GPU and available for geometryShader
+		isSwapChainSurfaceSupported; 
 }
 //Function to check if ALL of the requested layers are available
 bool TriangleApplication::checkValidationLayerSupport()
@@ -525,4 +1041,65 @@ void TriangleApplication::getSwapChainImages()
 	{
 		throw std::runtime_error("Empty swapchain");
 	}
+}
+
+std::vector<char> TriangleApplication::readFile(const std::string& fileName)
+{
+	std::ifstream file(fileName, std::ios::ate | std::ios::binary);
+	//std::ios::ate: reading at the end of file --> can retrieve the size of the buffer
+	//std::ios::binary: read the file as binary file --> avoid text transformation
+	if (!file.is_open())
+	{
+		throw std::runtime_error("failed to open file");
+	}
+	size_t fileSize = (size_t)file.tellg();
+	std::vector<char> buffer(fileSize); //allocate the buffer
+
+	file.seekg(0); //go back to the starting point of the file: 0
+	file.read(buffer.data(), fileSize);
+
+	file.close();
+	return buffer;
+}
+
+VkShaderModule TriangleApplication::createShaderModule(std::vector<char> code)
+{
+	VkShaderModuleCreateInfo createInfo{};
+
+	createInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+	createInfo.codeSize = code.size();
+	createInfo.pCode = reinterpret_cast<const uint32_t*>(code.data());
+
+	VkShaderModule shaderModule;
+	if (vkCreateShaderModule(m_device, &createInfo, nullptr, &shaderModule) != VK_SUCCESS)
+	{
+		throw std::runtime_error("failed to create shader module");
+	}
+
+	return shaderModule;
+}
+
+void TriangleApplication::cleanupSwapchain()
+{
+	for (const auto& framebuffer : m_swapChainFramebuffers)
+	{
+		vkDestroyFramebuffer(m_device, framebuffer, nullptr);
+	}
+
+	for (const auto& imageView : m_imageViews)
+	{
+		vkDestroyImageView(m_device, imageView, nullptr);
+	}
+
+	vkDestroySwapchainKHR(m_device, m_swapchain, nullptr);
+}
+void TriangleApplication::recreateSwapchain()
+{
+	vkDeviceWaitIdle(m_device);
+
+	cleanupSwapchain();
+
+	createSwapChain(); //create new swapchain
+	createImageView(); //create image views for the image in the new swapchain
+	createFrameBuffer(); //create the frambuffer for the image views
 }
