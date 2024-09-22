@@ -1,0 +1,1 @@
+..\\Tools\\premake5.exe  --scripts=..\\prj\\premake5.lua vs2022
