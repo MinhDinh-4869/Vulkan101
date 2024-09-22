@@ -90,7 +90,7 @@ private:
 	std::vector<VkSemaphore> m_renderFinishedSemaphores;
 	std::vector<VkFence> m_inFlightFences;
 
-	uint32_t currentFrame;
+	uint32_t currentFrame = 0;
 
 	void initWindow();
 	void initVulkan();

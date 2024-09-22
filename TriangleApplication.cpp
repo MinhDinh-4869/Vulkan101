@@ -1,4 +1,5 @@
 #include "TriangleApplication.h"
+#include <cassert>
 
 void TriangleApplication::run()
 {
@@ -51,7 +52,7 @@ void TriangleApplication::mainLoop()
 
 void TriangleApplication::cleanup()
 {
-	cleanup();
+	//cleanup();
 
 	for (int i = 0; i < MAX_IN_FLIGHT_FRAMES; i++)
 	{
@@ -122,6 +123,7 @@ void TriangleApplication::drawFrames()
 	vkQueueSubmit(B, fence: F);
 	*/
 
+	assert(currentFrame < MAX_IN_FLIGHT_FRAMES);
 	vkWaitForFences(m_device, 1, &m_inFlightFences[currentFrame], VK_TRUE, UINT64_MAX); //wait for an in flight image to be rendered
 	//Wait for previous frame to finish first, then the fence and the semaphore can be used
 	//As wait for fence is waiting until fence is in signaled state, then first frame could be blocked infinitely --> set the state of the fence tobe signaled when it is created
@@ -317,6 +319,8 @@ void TriangleApplication::createLogicalDevice()
 	deviceInfo.ppEnabledLayerNames = validationLayers.data();
 	deviceInfo.pNext = nullptr;
 
+	deviceInfo.flags = VK_QUEUE_GRAPHICS_BIT;
+
 	//set up extension
 	deviceInfo.enabledExtensionCount = static_cast<uint32_t>(deviceExtensions.size());
 	deviceInfo.ppEnabledExtensionNames = deviceExtensions.data();
@@ -494,8 +498,8 @@ void TriangleApplication::createRenderPass()
 void TriangleApplication::createGraphicsPipeline()
 {
 	//Read the shaders: vertext shader and fragment shader
-	std::vector<char> vertShaderCode = readFile("vert.spv");
-	std::vector<char> fragShaderCode = readFile("frag.spv");
+	std::vector<char> vertShaderCode = readFile("D://Vulkan101/vert.spv");
+	std::vector<char> fragShaderCode = readFile("D://Vulkan101/frag.spv");
 
 	//After having the code, wrap it in to a vKShaderModule
 	m_vertextShaderModule = createShaderModule(vertShaderCode);
